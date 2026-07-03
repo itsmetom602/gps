@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Browser Voice GPS</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        #map {
+            flex: 1;
+            width: 100%;
+        }
+        #controls {
+            padding: 15px;
+            background: #ffffff;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.15);
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .input-group {
+            display: flex;
+            gap: 5px;
+        }
+        input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        button {
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #voice-panel {
+            background: #f8f9fa;
+            border-left: 4px solid #28a745;
+            padding: 10px;
+            border-radius: 3px;
+            font-weight: 500;
+            min-height: 24px;
+        }
+        #status-panel {
+            font-size: 12px;
+            color: #666;
+            margin-top: -5px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div id="controls">
+        <div class="input-group">
+            <input type="text" id="destination" placeholder="Enter destination (lat, lng or city name)..." value="Times Square, New York">
+            <button onclick="startNavigation()">Navigate</button>
+        </div>
+        <div id="voice-panel">Press "Navigate" to begin. Ensure location permissions are allowed.</div>
+        <div id="status-panel">Screen Status: Awake mode inactive.</div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script>
+        let map;
+        let userMarker;
+        let currentRoutePolyline;
+        let userCoords = null;
+        let routeSteps = [];
+        let spokenSteps = new Set();
+        let wakeLock = null;
+
+        // Initialize Map
+        function initMap() {
+            map = L.map('map').setView([0, 0], 2);
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors'
+            }).addTo(map);
+
+            if (navigator.geolocation) {
+                navigator.geolocation.watchPosition(updateLocation, handleLocationError, {
+                    enableHighAccuracy: true,
+                    maximumAge: 0,
+                    timeout: 5000
+                });
+            } else {
+                alert("Geolocation is not supported by this browser.");
+            }
+
+            // Automatically request Screen Wake Lock when the user interacts with the app
+            document.addEventListener('click', requestWakeLock);
+        }
+
+        // SCREEN WAKE LOCK: Keeps Android screen turned on
+        async function requestWakeLock() {
+            if ('wakeLock' in navigator) {
+                try {
+                    if (!wakeLock) {
+                        wakeLock = await navigator.wakeLock.request('screen');
+                        document.getElementById('status-panel').innerText = "Screen Status: Stay-Awake Active 📱";
+                        
+                        // If user minimizes the app and returns, re-request lock
+                        wakeLock.addEventListener('release', () => {
+                            wakeLock = null;
+                            document.getElementById('status-panel').innerText = "Screen Status: Awake mode inactive.";
+                        });
+                    }
+                } catch (err) {
+                    console.error(`${err.name}, ${err.message}`);
+                    document.getElementById('status-panel').innerText = "Screen Status: Wake lock failed.";
+                }
+            } else {
+                document.getElementById('status-panel').innerText = "Screen Status: Wake Lock not supported on this browser.";
+            }
+        }
+
+        // Re-request wake lock automatically if user switches back to the browser tab
+        document.addEventListener('visibilitychange', async () => {
+            if (wakeLock !== null && document.visibilityState === 'visible') {
+                await requestWakeLock();
+            }
+        });
+
+        // Handle GPS Location Updates
+        function updateLocation(position) {
+            const lat = position.coords.coords ? position.coords.coords.latitude : position.coords.latitude;
+            const lng = position.coords.coords ? position.coords.coords.longitude : position.coords.longitude;
+            userCoords = [lat, lng];
+
+            if (!userMarker) {
+                userMarker = L.marker(userCoords).addTo(map).bindPopup("You are here").openPopup();
+                map.setView(userCoords, 16);
+            } else {
+                userMarker.setLatLng(userCoords);
+            }
+
+            checkRouteProximity();
+        }
+
+        function handleLocationError(error) {
+            console.warn(`ERROR(${error.code}): ${error.message}`);
+        }
+
+        // Speak guidance text
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel(); 
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.rate = 1.0; 
+                window.speechSynthesis.speak(utterance);
+                document.getElementById('voice-panel').innerText = text;
+            }
+        }
+
+        // Geocode destination name and Fetch Route
+        async function startNavigation() {
+            // Trigger wake lock immediately when clicking the button
+            await requestWakeLock();
+
+            const destInput = document.getElementById('destination').value;
+            if (!userCoords) {
+                alert("Waiting for your GPS coordinates. Please allow location access.");
+                return;
+            }
+
+            try {
+                const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(destInput)}`);
+                const data = await response.json();
+                
+                if (data.length === 0) {
+                    alert("Destination not found.");
+                    return;
+                }
+
+                const destCoords = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+                getRoute(userCoords, destCoords);
+
+            } catch (err) {
+                console.error(err);
+                alert("Error searching for location.");
+            }
+        }
+
+        // Get Turn-by-Turn Route from OSRM API
+        async function getRoute(start, end) {
+            const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson&steps=true`;
+            
+            try {
+                const response = await fetch(osrmUrl);
+                const data = await response.json();
+
+                if (data.code !== 'Ok') {
+                    alert("Could not calculate a driving route.");
+                    return;
+                }
+
+                if (currentRoutePolyline) map.removeLayer(currentRoutePolyline);
+
+                const coordinates = data.routes[0].geometry.coordinates.map(coord => [coord[1], coord[0]]);
+                currentRoutePolyline = L.polyline(coordinates, {color: 'blue', weight: 5}).addTo(map);
+                map.fitBounds(currentRoutePolyline.getBounds());
+
+                routeSteps = data.routes[0].legs[0].steps;
+                spokenSteps.clear();
+
+                speak("Route found. Starting navigation. " + routeSteps[0].maneuver.instruction);
+
+            } catch (err) {
+                console.error(err);
+                alert("Error fetching directions.");
+            }
+        }
+
+        // Check if the user has reached a turn threshold
+        function checkRouteProximity() {
+            if (routeSteps.length === 0 || !userCoords) return;
+
+            routeSteps.forEach((step, index) => {
+                if (spokenSteps.has(index)) return;
+
+                const stepLat = step.maneuver.location[1];
+                const stepLng = step.maneuver.location[0];
+                
+                const distance = getDistanceInMeters(userCoords[0], userCoords[1], stepLat, stepLng);
+
+                if (distance < 40) {
+                    speak(step.maneuver.instruction);
+                    spokenSteps.add(index);
+                }
+            });
+        }
+
+        // Haversine distance formula
+        function getDistanceInMeters(lat1, lon1, lat2, lon2) {
+            const R = 6371e3; 
+            const phi1 = lat1 * Math.PI/180;
+            const phi2 = lat2 * Math.PI/180;
+            const deltaPhi = (lat2-lat1) * Math.PI/180;
+            const deltaLambda = (lon2-lon1) * Math.PI/180;
+
+            const a = Math.sin(deltaPhi/2) * Math.sin(deltaPhi/2) +
+                      Math.cos(phi1) * Math.cos(phi2) *
+                      Math.sin(deltaLambda/2) * Math.sin(deltaLambda/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+            return R * c; 
+        }
+
+        window.onload = initMap;
+    </script>
+</body>
+</html>
